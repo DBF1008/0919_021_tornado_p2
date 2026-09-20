@@ -1217,17 +1217,28 @@ def _parse_header(line: str) -> tuple[str, dict[str, str]]:
     True
     >>> d['foo']
     'b\\a"r'
+
+    Valueless parameters (as used in websocket extension negotiations)
+    are preserved with a value of None:
+
+    >>> _parse_header('permessage-deflate; client_max_window_bits')
+    ('permessage-deflate', {'client_max_window_bits': None})
     """
     parts = _parseparam(";" + line)
     key = next(parts)
     # decode_params treats first argument special, but we already stripped key
     params = [("Dummy", "value")]
+    valueless_params = []
     for p in parts:
         i = p.find("=")
         if i >= 0:
             name = p[:i].strip().lower()
             value = p[i + 1 :].strip()
             params.append((name, native_str(value)))
+        else:
+            # Valueless parameter (e.g. websocket extension parameters
+            # such as "client_max_window_bits" without a value).
+            valueless_params.append(p.strip().lower())
     decoded_params = email.utils.decode_params(params)
     decoded_params.pop(0)  # get rid of the dummy again
     pdict = {}
@@ -1236,6 +1247,8 @@ def _parse_header(line: str) -> tuple[str, dict[str, str]]:
         if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
             value = value[1:-1]
         pdict[name] = value
+    for name in valueless_params:
+        pdict[name] = None  # type: ignore[assignment]
     return key, pdict
 
 

@@ -13,6 +13,7 @@ from tornado.httputil import (
     HTTPInputError,
     HTTPServerRequest,
     ParseMultipartConfig,
+    _parse_header,
     format_timestamp,
     parse_cookie,
     parse_multipart_form_data,
@@ -616,6 +617,49 @@ class ParseRequestStartLineTest(unittest.TestCase):
         self.assertEqual(parsed_start_line.method, self.METHOD)
         self.assertEqual(parsed_start_line.path, self.PATH)
         self.assertEqual(parsed_start_line.version, self.VERSION)
+
+
+class ParseHeaderTest(unittest.TestCase):
+    def test_parse_header_with_values(self):
+        self.assertEqual(
+            _parse_header("permessage-deflate; server_max_window_bits=10"),
+            ("permessage-deflate", {"server_max_window_bits": "10"}),
+        )
+
+    def test_parse_header_valueless_parameter(self):
+        # Valueless parameters (as used in websocket extension
+        # negotiations, e.g. "client_max_window_bits" without a value)
+        # must be preserved with a value of None.
+        self.assertEqual(
+            _parse_header("permessage-deflate; client_max_window_bits"),
+            ("permessage-deflate", {"client_max_window_bits": None}),
+        )
+
+    def test_parse_header_mixed_parameters(self):
+        key, params = _parse_header(
+            "permessage-deflate; server_no_context_takeover; "
+            "client_max_window_bits=12; client_no_context_takeover"
+        )
+        self.assertEqual(key, "permessage-deflate")
+        self.assertEqual(
+            params,
+            {
+                "server_no_context_takeover": None,
+                "client_max_window_bits": "12",
+                "client_no_context_takeover": None,
+            },
+        )
+
+    def test_parse_header_quoted_and_rfc2231(self):
+        key, params = _parse_header(
+            "form-data; foo=\"b\\\\a\\\"r\"; file*=utf-8''T%C3%A4st"
+        )
+        self.assertEqual(key, "form-data")
+        self.assertEqual(params["foo"], 'b\\a"r')
+        self.assertEqual(
+            params["file"],
+            r"T\u00e4st".encode("ascii").decode("unicode_escape"),
+        )
 
 
 class ParseCookieTest(unittest.TestCase):
