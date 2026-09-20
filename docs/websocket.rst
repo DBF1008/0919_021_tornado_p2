@@ -30,6 +30,7 @@
 
    .. automethod:: WebSocketHandler.check_origin
    .. automethod:: WebSocketHandler.get_compression_options
+   .. automethod:: WebSocketHandler.get_websocket_rate_limiter
    .. automethod:: WebSocketHandler.set_nodelay
 
    Other
@@ -38,6 +39,12 @@
    .. automethod:: WebSocketHandler.ping
    .. automethod:: WebSocketHandler.on_pong
    .. autoexception:: WebSocketClosedError
+
+   Rate limiting
+   -------------
+
+   .. autoclass:: WebSocketRateLimiter
+      :members:
 
 
    Client-side support

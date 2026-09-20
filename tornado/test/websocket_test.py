@@ -10,6 +10,7 @@ import unittest
 from tornado import gen
 from tornado.concurrent import Future
 from tornado.httpclient import HTTPError, HTTPRequest
+from tornado.httputil import HTTPHeaders
 from tornado.locks import Event
 from tornado.log import app_log, gen_log
 from tornado.netutil import Resolver
@@ -34,6 +35,9 @@ from tornado.websocket import (
     WebSocketClosedError,
     WebSocketError,
     WebSocketHandler,
+    WebSocketProtocol13,
+    WebSocketRateLimiter,
+    _WebSocketParams,
     websocket_connect,
 )
 
@@ -994,3 +998,409 @@ class MaxMessageSizeTest(WebSocketBaseTestCase):
         self.assertEqual(ws.close_reason, "message too big")
         # TODO: Needs tests of messages split over multiple
         # continuation frames.
+
+
+def _make_protocol(compression_options=None):
+    return WebSocketProtocol13(
+        typing.cast(typing.Any, object()),
+        False,
+        _WebSocketParams(compression_options=compression_options),
+    )
+
+
+class PerMessageDeflateExtensionParsingTest(unittest.TestCase):
+    def parse(self, header_value):
+        headers = HTTPHeaders()
+        if header_value is not None:
+            headers["Sec-WebSocket-Extensions"] = header_value
+        return _make_protocol()._parse_extensions_header(headers)
+
+    def test_no_header(self):
+        self.assertEqual(self.parse(None), [])
+
+    def test_valueless_parameters_preserved(self):
+        # RFC 7692 uses valueless parameters such as
+        # "client_max_window_bits"; they must be parsed as None instead
+        # of being dropped.
+        [(name, params)] = self.parse("permessage-deflate; client_max_window_bits")
+        self.assertEqual(name, "permessage-deflate")
+        self.assertEqual(params, {"client_max_window_bits": None})
+
+    def test_valued_parameters(self):
+        [(name, params)] = self.parse(
+            "permessage-deflate; server_max_window_bits=12; "
+            "client_no_context_takeover; server_no_context_takeover"
+        )
+        self.assertEqual(name, "permessage-deflate")
+        self.assertEqual(
+            params,
+            {
+                "server_max_window_bits": "12",
+                "client_no_context_takeover": None,
+                "server_no_context_takeover": None,
+            },
+        )
+
+    def test_multiple_extensions(self):
+        extensions = self.parse(
+            "permessage-deflate; client_max_window_bits, x-other; foo=bar"
+        )
+        self.assertEqual(len(extensions), 2)
+        self.assertEqual(extensions[0][0], "permessage-deflate")
+        self.assertEqual(extensions[1], ("x-other", {"foo": "bar"}))
+
+    def test_quoted_value(self):
+        [(name, params)] = self.parse('permessage-deflate; server_max_window_bits="12"')
+        self.assertEqual(params, {"server_max_window_bits": "12"})
+
+
+class PerMessageDeflateNegotiationTest(unittest.TestCase):
+    def negotiate(self, offered, options):
+        return _make_protocol(options)._negotiate_permessage_deflate(offered, options)
+
+    def test_no_options_no_params(self):
+        # With an empty configuration the response carries no
+        # parameters (except echoing an offered server_max_window_bits).
+        self.assertEqual(self.negotiate({"client_max_window_bits": None}, {}), {})
+
+    def test_no_context_takeover(self):
+        params = self.negotiate(
+            {},
+            {"server_no_context_takeover": True, "client_no_context_takeover": True},
+        )
+        self.assertEqual(
+            params,
+            {"server_no_context_takeover": None, "client_no_context_takeover": None},
+        )
+
+    def test_no_context_takeover_disabled(self):
+        params = self.negotiate(
+            {"server_no_context_takeover": None},
+            {"server_no_context_takeover": False},
+        )
+        self.assertEqual(params, {})
+
+    def test_no_context_takeover_offer_echoed(self):
+        # When not configured, an offered no_context_takeover request
+        # is honored by echoing it in the response.
+        params = self.negotiate(
+            {
+                "server_no_context_takeover": None,
+                "client_no_context_takeover": None,
+            },
+            {},
+        )
+        self.assertEqual(
+            params,
+            {"server_no_context_takeover": None, "client_no_context_takeover": None},
+        )
+
+    def test_server_max_window_bits_from_config(self):
+        params = self.negotiate({}, {"server_max_window_bits": 12})
+        self.assertEqual(params, {"server_max_window_bits": 12})
+
+    def test_server_max_window_bits_capped_by_offer(self):
+        params = self.negotiate(
+            {"server_max_window_bits": "10"}, {"server_max_window_bits": 12}
+        )
+        self.assertEqual(params, {"server_max_window_bits": 10})
+
+    def test_server_max_window_bits_offer_echoed(self):
+        # Not configured: the client's requested limit is echoed so
+        # both sides agree on it.
+        params = self.negotiate({"server_max_window_bits": "10"}, {})
+        self.assertEqual(params, {"server_max_window_bits": 10})
+
+    def test_client_max_window_bits_requires_offer(self):
+        # client_max_window_bits must not appear in the response unless
+        # the client offered it (RFC 7692 section 7.1.2.2).
+        params = self.negotiate({}, {"client_max_window_bits": 10})
+        self.assertEqual(params, {})
+
+    def test_client_max_window_bits_valueless_offer(self):
+        # A valueless offer lets the server pick any value.
+        params = self.negotiate(
+            {"client_max_window_bits": None}, {"client_max_window_bits": 10}
+        )
+        self.assertEqual(params, {"client_max_window_bits": 10})
+
+    def test_client_max_window_bits_capped_by_offer(self):
+        params = self.negotiate(
+            {"client_max_window_bits": "9"}, {"client_max_window_bits": 12}
+        )
+        self.assertEqual(params, {"client_max_window_bits": 9})
+
+    def test_unknown_parameter_rejected(self):
+        with self.assertRaises(ValueError):
+            self.negotiate({"x_unknown": None}, {})
+
+    def test_invalid_window_bits_rejected(self):
+        for bad in ("7", "16", "abc"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.negotiate({"server_max_window_bits": bad}, {})
+                with self.assertRaises(ValueError):
+                    self.negotiate({}, {"server_max_window_bits": bad})
+
+    def test_window_bits_bounds(self):
+        params = self.negotiate(
+            {}, {"server_max_window_bits": 8, "client_max_window_bits": 15}
+        )
+        # client_max_window_bits is omitted because it was not offered.
+        self.assertEqual(params, {"server_max_window_bits": 8})
+
+
+class PerMessageDeflateHandshakeTest(WebSocketBaseTestCase):
+    def get_app(self):
+        self.handlers: list[WebSocketHandler] = []
+        test = self
+
+        class NegotiatingHandler(TestWebSocketHandler):
+            def initialize(self, close_future=None, compression_options=None):
+                self.handlers = test.handlers
+                self.handlers.append(self)
+                return super().initialize(
+                    close_future=close_future, compression_options=compression_options
+                )
+
+            def on_message(self, message):
+                self.write_message(message)
+
+        return Application(
+            [
+                (
+                    "/negotiated",
+                    NegotiatingHandler,
+                    dict(
+                        compression_options={
+                            "server_no_context_takeover": True,
+                            "client_no_context_takeover": True,
+                            "server_max_window_bits": 12,
+                            "client_max_window_bits": 10,
+                        }
+                    ),
+                ),
+                (
+                    "/default",
+                    NegotiatingHandler,
+                    dict(compression_options={}),
+                ),
+            ]
+        )
+
+    def parse_response_extensions(self, ws):
+        header = ws.headers["Sec-WebSocket-Extensions"]
+        headers = HTTPHeaders({"Sec-WebSocket-Extensions": header})
+        [(name, params)] = _make_protocol()._parse_extensions_header(headers)
+        self.assertEqual(name, "permessage-deflate")
+        return params
+
+    @gen_test
+    def test_negotiated_response_header(self):
+        ws = yield self.ws_connect("/negotiated", compression_options={})
+        params = self.parse_response_extensions(ws)
+        self.assertIn("server_no_context_takeover", params)
+        self.assertIn("client_no_context_takeover", params)
+        self.assertEqual(params["server_max_window_bits"], "12")
+        self.assertEqual(params["client_max_window_bits"], "10")
+
+        # The negotiated parameters must be reflected in the server's
+        # zlib contexts.
+        protocol = self.handlers[0].ws_connection
+        self.assertIsNotNone(protocol._compressor)
+        self.assertIsNotNone(protocol._decompressor)
+        self.assertEqual(protocol._compressor._max_wbits, 12)
+        self.assertEqual(protocol._decompressor._max_wbits, 10)
+        # no_context_takeover on both sides: no persistent contexts.
+        self.assertIsNone(protocol._compressor._compressor)
+        self.assertIsNone(protocol._decompressor._decompressor)
+
+        # Messages still round-trip correctly with the negotiated
+        # parameters in effect.
+        for i in range(3):
+            ws.write_message("hello %d" % i)
+            response = yield ws.read_message()
+            self.assertEqual(response, "hello %d" % i)
+
+    @gen_test
+    def test_default_response_has_no_parameters(self):
+        ws = yield self.ws_connect("/default", compression_options={})
+        params = self.parse_response_extensions(ws)
+        self.assertEqual(params, {})
+        ws.write_message("hello")
+        response = yield ws.read_message()
+        self.assertEqual(response, "hello")
+
+    @gen_test
+    def test_client_offer_parameters(self):
+        # The client offers server_max_window_bits; a server without
+        # its own limit echoes the offered value.
+        ws = yield self.ws_connect(
+            "/default",
+            compression_options={
+                "server_max_window_bits": 10,
+                "client_no_context_takeover": True,
+            },
+        )
+        params = self.parse_response_extensions(ws)
+        self.assertEqual(params["server_max_window_bits"], "10")
+        self.assertIn("client_no_context_takeover", params)
+        protocol = self.handlers[0].ws_connection
+        self.assertEqual(protocol._compressor._max_wbits, 10)
+        ws.write_message("hello")
+        response = yield ws.read_message()
+        self.assertEqual(response, "hello")
+
+
+class WebSocketRateLimiterTest(unittest.TestCase):
+    def test_allows_up_to_limit(self):
+        limiter = WebSocketRateLimiter(3, 60.0)
+        for i in range(3):
+            self.assertTrue(limiter.is_allowed("1.2.3.4", now=100.0 + i))
+        self.assertFalse(limiter.is_allowed("1.2.3.4", now=103.0))
+
+    def test_window_slides(self):
+        limiter = WebSocketRateLimiter(2, 10.0)
+        self.assertTrue(limiter.is_allowed("1.2.3.4", now=0.0))
+        self.assertTrue(limiter.is_allowed("1.2.3.4", now=5.0))
+        self.assertFalse(limiter.is_allowed("1.2.3.4", now=9.0))
+        # The first event expires at t=10 (the cutoff is inclusive).
+        self.assertTrue(limiter.is_allowed("1.2.3.4", now=10.0))
+
+    def test_per_ip_isolation(self):
+        limiter = WebSocketRateLimiter(1, 60.0)
+        self.assertTrue(limiter.is_allowed("1.1.1.1", now=0.0))
+        self.assertFalse(limiter.is_allowed("1.1.1.1", now=1.0))
+        self.assertTrue(limiter.is_allowed("2.2.2.2", now=1.0))
+
+    def test_rejected_attempts_do_not_consume_quota(self):
+        limiter = WebSocketRateLimiter(1, 10.0)
+        self.assertTrue(limiter.is_allowed("1.2.3.4", now=0.0))
+        for i in range(5):
+            self.assertFalse(limiter.is_allowed("1.2.3.4", now=1.0 + i))
+        # Only the single allowed connection counts; it expires at t=10.
+        self.assertTrue(limiter.is_allowed("1.2.3.4", now=10.1))
+
+    def test_expired_ips_are_forgotten(self):
+        limiter = WebSocketRateLimiter(1, 10.0, cleanup_interval=5.0)
+        for i in range(100):
+            self.assertTrue(limiter.is_allowed("10.0.0.%d" % i, now=float(i % 4)))
+        self.assertGreater(len(limiter._events), 50)
+        # Advance past the window; the next call triggers a full sweep.
+        self.assertTrue(limiter.is_allowed("10.0.0.200", now=1000.0))
+        self.assertEqual(set(limiter._events), {"10.0.0.200"})
+
+    def test_invalid_configuration(self):
+        with self.assertRaises(ValueError):
+            WebSocketRateLimiter(0, 10.0)
+        with self.assertRaises(ValueError):
+            WebSocketRateLimiter(1, 0.0)
+
+
+class WebSocketRateLimitTest(WebSocketBaseTestCase):
+    def get_app(self):
+        self.open_count = 0
+        test = self
+
+        class CountingHandler(TestWebSocketHandler):
+            def open(self):
+                test.open_count += 1
+
+            def on_message(self, message):
+                self.write_message(message)
+
+        return Application(
+            [("/ws", CountingHandler), ("/http", NonWebSocketHandler)],
+            websocket_rate_limit=2,
+            websocket_rate_limit_window=60,
+        )
+
+    @gen_test
+    def test_rate_limit_returns_429(self):
+        # The first two connections succeed.
+        for i in range(2):
+            ws = yield self.ws_connect("/ws")
+            ws.write_message("hello")
+            response = yield ws.read_message()
+            self.assertEqual(response, "hello")
+        self.assertEqual(self.open_count, 2)
+
+        # The third connection from the same IP is rejected with a 429
+        # during the handshake, before open() runs.
+        with self.assertRaises(HTTPError) as cm:
+            yield websocket_connect(
+                "ws://127.0.0.1:%d/ws" % self.get_http_port()
+            )
+        self.assertEqual(cm.exception.code, 429)
+        self.assertEqual(self.open_count, 2)
+
+        # Ordinary HTTP requests are not affected by the limiter.
+        response = yield self.http_client.fetch(
+            "http://127.0.0.1:%d/http" % self.get_http_port()
+        )
+        self.assertEqual(response.body, b"ok")
+
+    @gen_test
+    def test_limiter_shared_per_application(self):
+        yield self.ws_connect("/ws")
+        limiter = self._app._websocket_rate_limiter
+        self.assertIsNotNone(limiter)
+        self.assertEqual(limiter.max_connections, 2)
+        self.assertEqual(limiter.window_seconds, 60.0)
+        self.assertIn("127.0.0.1", limiter._events)
+
+
+class CompressionContextReleaseTest(WebSocketBaseTestCase):
+    def get_app(self):
+        self.close_future: Future[None] = Future()
+        self.protocols: list[typing.Any] = []
+        test = self
+
+        class ReleaseHandler(TestWebSocketHandler):
+            def initialize(self, close_future=None, compression_options=None):
+                return super().initialize(
+                    close_future=test.close_future, compression_options={}
+                )
+
+            def open(self):
+                test.protocols.append(self.ws_connection)
+
+            def on_message(self, message):
+                self.write_message(message)
+
+        return Application([("/", ReleaseHandler)])
+
+    @gen_test
+    def test_contexts_released_on_clean_close(self):
+        ws = yield self.ws_connect("/", compression_options={})
+        ws.write_message("hello")
+        response = yield ws.read_message()
+        self.assertEqual(response, "hello")
+
+        protocol = self.protocols[0]
+        self.assertIsNotNone(protocol._compressor)
+        self.assertIsNotNone(protocol._decompressor)
+
+        ws.close()
+        yield self.close_future
+        # By the time on_close fires, the zlib contexts must already
+        # have been released (not left lingering until GC).
+        self.assertIsNone(protocol._compressor)
+        self.assertIsNone(protocol._decompressor)
+
+    @gen_test
+    def test_contexts_released_on_abrupt_close(self):
+        ws = yield self.ws_connect("/", compression_options={})
+        ws.write_message("hello")
+        response = yield ws.read_message()
+        self.assertEqual(response, "hello")
+
+        protocol = self.protocols[0]
+        self.assertIsNotNone(protocol._compressor)
+
+        # Simulate an abnormal disconnect: close the client's stream
+        # without a websocket close handshake.
+        ws.protocol.stream.close()
+        yield self.close_future
+        self.assertIsNone(protocol._compressor)
+        self.assertIsNone(protocol._decompressor)

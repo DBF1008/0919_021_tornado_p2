@@ -20,8 +20,10 @@ import logging
 import os
 import struct
 import sys
+import time
 import warnings
 import zlib
+from collections import deque
 from collections.abc import Awaitable, Callable
 from types import TracebackType
 from typing import (
@@ -114,6 +116,84 @@ class WebSocketClosedError(WebSocketError):
 
 class _DecompressTooLargeError(Exception):
     pass
+
+
+class WebSocketRateLimiter:
+    """Sliding-window rate limiter for WebSocket connections, keyed by client IP.
+
+    Counts accepted connections per client IP within a sliding time
+    window and rejects new connections once ``max_connections`` is
+    reached.  Expired entries are pruned automatically (both on access
+    and via a periodic sweep) so that clients which stop connecting do
+    not leak memory.
+
+    .. versionadded:: 6.6
+    """
+
+    def __init__(
+        self,
+        max_connections: int,
+        window_seconds: float,
+        cleanup_interval: float | None = None,
+    ) -> None:
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self.max_connections = max_connections
+        self.window_seconds = float(window_seconds)
+        # How often the full sweep of stale IPs runs.  Defaults to the
+        # window length, which bounds the size of the per-IP deques.
+        self.cleanup_interval = (
+            float(cleanup_interval)
+            if cleanup_interval is not None
+            else self.window_seconds
+        )
+        self._events: dict[str, deque[float]] = {}
+        self._last_cleanup = 0.0
+
+    def is_allowed(self, ip: str, now: float | None = None) -> bool:
+        """Record a connection attempt from ``ip`` and return whether it is allowed.
+
+        Only allowed connections consume quota; rejected attempts are
+        not counted.
+        """
+        if now is None:
+            now = time.monotonic()
+        self._cleanup(now)
+        events = self._events.get(ip)
+        if events is None:
+            events = self._events[ip] = deque()
+        self._prune(events, now)
+        if len(events) >= self.max_connections:
+            return False
+        events.append(now)
+        return True
+
+    def _prune(self, events: deque[float], now: float) -> None:
+        cutoff = now - self.window_seconds
+        while events and events[0] <= cutoff:
+            events.popleft()
+
+    def _cleanup(self, now: float) -> None:
+        """Periodically drop IPs whose events have all expired."""
+        if now - self._last_cleanup < self.cleanup_interval:
+            return
+        self._last_cleanup = now
+        cutoff = now - self.window_seconds
+        # Timestamps are appended in increasing order, so an empty tail
+        # means the whole deque is expired.
+        stale = [
+            ip
+            for ip, events in self._events.items()
+            if not events or events[-1] <= cutoff
+        ]
+        for ip in stale:
+            del self._events[ip]
+
+    def clear(self) -> None:
+        """Forget all recorded connection attempts."""
+        self._events.clear()
 
 
 class _WebSocketParams:
@@ -268,12 +348,63 @@ class WebSocketHandler(tornado.web.RequestHandler):
             gen_log.debug(log_msg)
             return
 
+        # Reject connections that exceed the per-IP rate limit before
+        # the upgrade happens (and before ``open`` runs).  The 429
+        # response is a plain HTTP response; afterwards the underlying
+        # IOStream is closed directly instead of going through a
+        # WebSocket close frame.
+        rate_limiter = self.get_websocket_rate_limiter()
+        if rate_limiter is not None and not rate_limiter.is_allowed(
+            self.request.remote_ip or ""
+        ):
+            self.set_status(429)
+            log_msg = "WebSocket connection rate limit exceeded"
+            self.finish(log_msg)
+            gen_log.debug(log_msg)
+            http_connection = self.request.connection
+            stream = getattr(http_connection, "stream", None)
+            if stream is not None and not stream.closed():
+                stream.close()
+            return
+
         self.ws_connection = self.get_websocket_protocol()
         if self.ws_connection:
             await self.ws_connection.accept_connection(self)
         else:
             self.set_status(426, "Upgrade Required")
             self.set_header("Sec-WebSocket-Version", "7, 8, 13")
+
+    def get_websocket_rate_limiter(self) -> WebSocketRateLimiter | None:
+        """Returns the rate limiter used to throttle new connections.
+
+        By default, returns a `WebSocketRateLimiter` shared by all
+        handlers of this application when the ``websocket_rate_limit``
+        application setting is a positive integer (the maximum number
+        of connections per client IP within
+        ``websocket_rate_limit_window`` seconds, default 60).  Returns
+        None (no rate limiting) if the setting is absent or zero.
+
+        Override to customize the policy, e.g. to use a different key
+        than the client IP or to share a limiter across applications.
+
+        .. versionadded:: 6.6
+        """
+        max_connections = self.settings.get("websocket_rate_limit", None)
+        if not max_connections:
+            return None
+        window = float(self.settings.get("websocket_rate_limit_window", 60.0))
+        app = self.application
+        limiter: WebSocketRateLimiter | None = getattr(
+            app, "_websocket_rate_limiter", None
+        )
+        if (
+            limiter is None
+            or limiter.max_connections != max_connections
+            or limiter.window_seconds != window
+        ):
+            limiter = WebSocketRateLimiter(max_connections, window)
+            app._websocket_rate_limiter = limiter  # type: ignore[attr-defined]
+        return limiter
 
     @property
     def ping_interval(self) -> float | None:
@@ -404,6 +535,26 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
         ``mem_level`` specifies the amount of memory used for the internal compression state.
 
+        ``server_no_context_takeover`` (bool): if true, request that
+        messages sent by this server are compressed with a fresh
+        (non-persistent) zlib context.
+
+        ``client_no_context_takeover`` (bool): if true, require that
+        messages sent by the client are compressed with a fresh
+        (non-persistent) zlib context.
+
+        ``server_max_window_bits`` (int, 8-15): limit the LZ77 window
+        size used for messages sent by this server.
+
+        ``client_max_window_bits`` (int, 8-15): limit the LZ77 window
+        size the client may use for messages it sends.  Only negotiated
+        if the client's offer includes the ``client_max_window_bits``
+        parameter.
+
+        These parameters are negotiated with the peer according to
+        RFC 7692 section 7.1 and the result is returned in the
+        ``Sec-WebSocket-Extensions`` response header.
+
          These parameters are documented in detail here:
          https://docs.python.org/3.13/library/zlib.html#zlib.compressobj
 
@@ -412,8 +563,13 @@ class WebSocketHandler(tornado.web.RequestHandler):
         .. versionchanged:: 4.5
 
            Added ``compression_level`` and ``mem_level``.
+
+        .. versionchanged:: 6.6
+
+           Added ``server_no_context_takeover``,
+           ``client_no_context_takeover``, ``server_max_window_bits``,
+           and ``client_max_window_bits`` negotiation.
         """
-        # TODO: Add wbits option.
         return None
 
     def _open(self, *args: str, **kwargs: str) -> Awaitable[None] | None:
@@ -931,19 +1087,15 @@ class WebSocketProtocol13(WebSocketProtocol):
         extensions = self._parse_extensions_header(handler.request.headers)
         for ext in extensions:
             if ext[0] == "permessage-deflate" and self._compression_options is not None:
-                # TODO: negotiate parameters if compression_options
-                # specifies limits.
-                self._create_compressors("server", ext[1], self._compression_options)
-                if (
-                    "client_max_window_bits" in ext[1]
-                    and ext[1]["client_max_window_bits"] is None
-                ):
-                    # Don't echo an offered client_max_window_bits
-                    # parameter with no value.
-                    del ext[1]["client_max_window_bits"]
+                negotiated = self._negotiate_permessage_deflate(
+                    ext[1], self._compression_options
+                )
+                self._create_compressors(
+                    "server", negotiated, self._compression_options
+                )
                 handler.set_header(
                     "Sec-WebSocket-Extensions",
-                    httputil._encode_header("permessage-deflate", ext[1]),
+                    httputil._encode_header("permessage-deflate", negotiated),
                 )
                 break
 
@@ -970,11 +1122,134 @@ class WebSocketProtocol13(WebSocketProtocol):
 
     def _parse_extensions_header(
         self, headers: httputil.HTTPHeaders
-    ) -> list[tuple[str, dict[str, str]]]:
+    ) -> list[tuple[str, dict[str, Any]]]:
         extensions = headers.get("Sec-WebSocket-Extensions", "")
-        if extensions:
-            return [httputil._parse_header(e.strip()) for e in extensions.split(",")]
-        return []
+        if not extensions:
+            return []
+        result = []
+        for e in extensions.split(","):
+            e = e.strip()
+            if not e:
+                continue
+            # httputil._parse_header drops valueless parameters, but
+            # RFC 7692 uses them (e.g. "client_max_window_bits" with no
+            # value), so parse the parameters ourselves and map them to
+            # None.
+            parts = httputil._parseparam(";" + e)
+            name = next(parts).lower()
+            params: dict[str, Any] = {}
+            for p in parts:
+                key, sep, value = p.partition("=")
+                key = key.strip().lower()
+                if not key:
+                    continue
+                if sep:
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                        value = value[1:-1]
+                    params[key] = value
+                else:
+                    params[key] = None
+            result.append((name, params))
+        return result
+
+    # Parameters defined for permessage-deflate by RFC 7692 section 7.
+    _PERMESSAGE_DEFLATE_PARAMS = frozenset(
+        [
+            "server_no_context_takeover",
+            "client_no_context_takeover",
+            "server_max_window_bits",
+            "client_max_window_bits",
+        ]
+    )
+
+    @staticmethod
+    def _validate_window_bits(value: Any, name: str) -> int:
+        try:
+            bits = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("invalid %s value %r" % (name, value))
+        if not 8 <= bits <= zlib.MAX_WBITS:
+            raise ValueError(
+                "invalid %s value %r; allowed range 8-%d"
+                % (name, value, zlib.MAX_WBITS)
+            )
+        return bits
+
+    def _select_window_bits(
+        self,
+        name: str,
+        offered: dict[str, Any],
+        options: dict[str, Any],
+        response_requires_offer: bool,
+    ) -> int | None:
+        """Choose a *_max_window_bits value per RFC 7692 section 7.1.2.
+
+        Returns the value to include in the response, or None to omit
+        the parameter (meaning the default of 15 bits).
+        """
+        offered_present = name in offered
+        offered_value = offered.get(name)
+        if offered_present and offered_value is not None:
+            offered_bits: int | None = self._validate_window_bits(offered_value, name)
+        else:
+            offered_bits = None
+        config_value = options.get(name)
+        if config_value is None:
+            # Not configured: honor the peer's requested limit, if any,
+            # by echoing it back so both sides agree on it.
+            if offered_bits is not None and not response_requires_offer:
+                return offered_bits
+            return None
+        bits = self._validate_window_bits(config_value, name)
+        if offered_bits is not None:
+            bits = min(bits, offered_bits)
+        if response_requires_offer and not offered_present:
+            # client_max_window_bits may only appear in the response if
+            # the client offered it.
+            return None
+        return bits
+
+    def _negotiate_permessage_deflate(
+        self, offered: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build the permessage-deflate response parameters (RFC 7692
+        section 7.1.2) from the client's offer and the configured
+        compression options.
+
+        Raises ValueError for unsupported or malformed offered
+        parameters.
+        """
+        for key in offered:
+            if key not in self._PERMESSAGE_DEFLATE_PARAMS:
+                raise ValueError("unsupported permessage-deflate parameter %r" % key)
+        params: dict[str, Any] = {}
+        for side in ("server", "client"):
+            key = side + "_no_context_takeover"
+            config_value = options.get(key)
+            # Include the parameter if the configuration requests it,
+            # or (when unconfigured) if the client offered it, in which
+            # case we honor the request by echoing it.  An explicit
+            # False in the configuration suppresses it entirely.
+            if config_value or (config_value is None and key in offered):
+                params[key] = None
+        server_bits = self._select_window_bits(
+            "server_max_window_bits",
+            offered,
+            options,
+            response_requires_offer=False,
+        )
+        if server_bits is not None:
+            params["server_max_window_bits"] = server_bits
+        client_bits = self._select_window_bits(
+            "client_max_window_bits",
+            offered,
+            options,
+            response_requires_offer=True,
+        )
+        if client_bits is not None:
+            params["client_max_window_bits"] = client_bits
+        return params
 
     def _process_server_headers(
         self, key: str | bytes, headers: httputil.HTTPHeaders
@@ -1123,7 +1398,24 @@ class WebSocketProtocol13(WebSocketProtocol):
                 await self._receive_frame()
         except StreamClosedError:
             self._abort()
+        finally:
+            # Whatever the exit path (clean close handshake, abort, or
+            # error), the zlib contexts are no longer needed; release
+            # them immediately instead of letting them linger until GC.
+            self._release_compression_contexts()
         self.handler.on_ws_connection_close(self.close_code, self.close_reason)
+
+    def _release_compression_contexts(self) -> None:
+        """Release the zlib compressor/decompressor state immediately.
+
+        The zlib context objects can hold a significant amount of
+        memory (especially with context takeover and large window
+        bits).  They must not be kept alive while we wait for the
+        peer's close frame, so every connection-close path calls this
+        method as soon as compression is no longer needed.
+        """
+        self._compressor = None
+        self._decompressor = None
 
     async def _read_bytes(self, n: int) -> bytes:
         data = await self.stream.read_bytes(n)
@@ -1219,7 +1511,13 @@ class WebSocketProtocol13(WebSocketProtocol):
             return None
 
         if self._frame_compressed:
-            assert self._decompressor is not None
+            if self._decompressor is None:
+                # The compression contexts have already been released
+                # (the connection is closing); we can no longer
+                # decompress, so abort instead of delivering corrupt
+                # data.
+                self._abort()
+                return None
             try:
                 data = self._decompressor.decompress(data)
             except _DecompressTooLargeError:
@@ -1281,6 +1579,12 @@ class WebSocketProtocol13(WebSocketProtocol):
                 except StreamClosedError:
                     self._abort()
             self.server_terminated = True
+        # No more messages will be compressed or decompressed once
+        # either side has terminated; free the zlib contexts now rather
+        # than waiting for the peer's close-frame ack (which may never
+        # arrive) or for ``on_close`` to run.
+        if self.server_terminated or self.client_terminated:
+            self._release_compression_contexts()
         if self.client_terminated:
             if self._waiting is not None:
                 self.stream.io_loop.remove_timeout(self._waiting)
@@ -1428,13 +1732,34 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         if subprotocols is not None:
             request.headers["Sec-WebSocket-Protocol"] = ",".join(subprotocols)
         if compression_options is not None:
-            # Always offer to let the server set our max_wbits (and even though
-            # we don't offer it, we will accept a client_no_context_takeover
-            # from the server).
-            # TODO: set server parameters for deflate extension
-            # if requested in self.compression_options.
-            request.headers["Sec-WebSocket-Extensions"] = (
-                "permessage-deflate; client_max_window_bits"
+            # Build the permessage-deflate offer (RFC 7692 section
+            # 7.1.1) from the configured compression options.  Always
+            # offer to let the server set our max_wbits (and even
+            # though we don't offer it, we will accept a
+            # client_no_context_takeover from the server).
+            offer: dict[str, Any] = {}
+            if compression_options.get("client_no_context_takeover"):
+                offer["client_no_context_takeover"] = None
+            if compression_options.get("server_no_context_takeover"):
+                offer["server_no_context_takeover"] = None
+            client_wbits = compression_options.get("client_max_window_bits")
+            if client_wbits is not None:
+                offer["client_max_window_bits"] = (
+                    WebSocketProtocol13._validate_window_bits(
+                        client_wbits, "client_max_window_bits"
+                    )
+                )
+            else:
+                offer["client_max_window_bits"] = None
+            server_wbits = compression_options.get("server_max_window_bits")
+            if server_wbits is not None:
+                offer["server_max_window_bits"] = (
+                    WebSocketProtocol13._validate_window_bits(
+                        server_wbits, "server_max_window_bits"
+                    )
+                )
+            request.headers["Sec-WebSocket-Extensions"] = httputil._encode_header(
+                "permessage-deflate", offer
             )
 
         # Websocket connection is currently unable to follow redirects
